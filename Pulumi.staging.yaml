@@ -1,0 +1,4 @@
+config:
+  Razr-fargate-assignment:environment: staging
+  Razr-fargate-assignment:taskCount: "2"
+  aws:region: us-west-2

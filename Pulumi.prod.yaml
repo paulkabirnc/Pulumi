@@ -1,0 +1,4 @@
+config:
+  Razr-fargate-assignment:environment: prod
+  Razr-fargate-assignment:taskCount: "3"
+  aws:region: us-west-2
