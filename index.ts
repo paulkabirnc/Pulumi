@@ -12,19 +12,21 @@ import { LineGraphMetricWidget } from "@pulumi/awsx/classic/cloudwatch";
 
 //  Environment specific values from Pulumi config
 
-const config = new pulumi.Config();
-const environment = config.get("environment") || "dev";
+const config = new pulumi.Config();  // config reader pulls data from pulumi.dev.yaml/ pulumi.staging/yaml
+const environment = config.get("environment") || "dev"; 
 const taskCount = config.getNumber("taskCount") || 1;
 
 
-// Default VPC
-const vpc = aws.ec2.getVpc({default: true});
+// Get the Default VPC
+const vpc = aws.ec2.getVpc({default: true}); 
 
-// Get all Ssubnets in the VPC for the containers
+// Get all Ssubnets in the VPC for the containers per Fargate
 const subnetIds = vpc.then(v=>
     aws.ec2.getSubnets({ filters: [{ name: "vpc-id", values: [v.id]}]}).then(s => s.ids)
 );
 
+//  SG acts as a Firewall for Fargate tasks, opened port 8080 for Java app and outbound traffic for pgBouncer to reach the DB
+// However, for production, ingress should be pointed to Load Balancer SG, and egress to db SG only.
 
 const sg = new aws.ec2.SecurityGroup(`java-app-sg-${environment}`,
     {description: `Security group Java app - ${environment}`, 
@@ -48,7 +50,7 @@ egress: [
     description: " Allow all outbound"
 }
 ],
-
+//  Keeping track of the environment
 tags: {
     Name:  `java-app-sg-${environment}`,
     Environment: environment
@@ -58,7 +60,8 @@ tags: {
 });
 
 
-//  IAM Roles  - Execution Role for Fargate 
+//  IAM Roles  - Execution Role for Fargate to pull docker images from ECR and CloudWatch logs
+//  Restricting it ecs-tasks usage only
 
 const executionRole = new aws.iam.Role(`ecs-execution-role-${environment}`, {
     assumeRolePolicy: JSON.stringify ({
@@ -76,7 +79,7 @@ const executionRole = new aws.iam.Role(`ecs-execution-role-${environment}`, {
 });
 
 
-//  AWS managed policy for ECS task execution
+//  AWS managed policy for ECS  execution role
 
 new aws.iam.RolePolicyAttachment(`ecs-execution-policy-${environment}`, {
 
@@ -85,8 +88,7 @@ new aws.iam.RolePolicyAttachment(`ecs-execution-policy-${environment}`, {
 
 });
 
-// Task role - used by the containers
-// Needs SSM permissions for ECS Exec ( SSH into containers)
+// Task role - used by the Containers ( Java App, pgBouncer)
 
 const taskRole = new aws.iam.Role(`ecs-task-role-${environment}`, {
 
@@ -103,8 +105,14 @@ const taskRole = new aws.iam.Role(`ecs-task-role-${environment}`, {
     tags: {Environment: environment}
 });
 
-
+// Requirement#3
+// ------- 2 Roles ---- 
+// Execution role- Images, logs
+// Task role - 
+// The task role allows running containers permission to use SSM which powers ECS Exec.
+// SSM permissions for ECS Exec ( SSH into containers using AWS System manager)
 // SSM Policy to enable SSH into containers through ECS Exec
+// Benefit:  If containers are compromised, Fargate is still intact
 
     new aws.iam.RolePolicy(`ecs-exec-policy-${environment}`, {
 
@@ -129,8 +137,8 @@ const taskRole = new aws.iam.Role(`ecs-task-role-${environment}`, {
     });
 
 
-
-// CloudWatch Log Group
+// Each environment gets its own cloudWatch and ECS Cluster
+// CloudWatch Log Group used by both Java App & pgBouncer environment specific
 
 const logGroup = new aws.cloudwatch.LogGroup(`fargate-logs-${environment}`, {
     retentionInDays: 7,
@@ -138,31 +146,29 @@ const logGroup = new aws.cloudwatch.LogGroup(`fargate-logs-${environment}`, {
 
 });
 
-
-// ECS Cluster
-// Runs Fargate tasks
+// Environment specific ECS Cluster
+// 
 
 const cluster = new aws.ecs.Cluster(`java-cluster-${environment}`, {
     tags: {Environment: environment}
 });
 
 
-
-
 // Task definition
-// Both containers Java App and PgBouncer 
+// Defines both containers Java App and PgBouncer run in the same task
 
 const taskDefinition = new aws.ecs.TaskDefinition(`java-task-${environment}`, {
     family: `java-pgbouncer-${environment}`,
     cpu: "512",
     memory: "1024",
     networkMode: "awsvpc",
-    requiresCompatibilities: ["FARGATE"],
-    executionRoleArn: executionRole.arn,
-    taskRoleArn: taskRole.arn,
+    requiresCompatibilities: ["FARGATE"],  // Not EC2
+    executionRoleArn: executionRole.arn,  // images, logs
+    taskRoleArn: taskRole.arn,            // Roles used by the containers ( ECS Exec/SSH)
     containerDefinitions: pulumi.all([logGroup.name]).apply(([lgName]) =>
         JSON.stringify([
             {
+                // Container #1  Java App
                 name: "java-app",
                 image: "amazoncorretto:17",
                 essential: true,
@@ -172,7 +178,7 @@ const taskDefinition = new aws.ecs.TaskDefinition(`java-task-${environment}`, {
                 }],
                 environment: [
                     { name: "ENVIRONMENT", value: environment },
-                    { name: "DB_HOST", value: "localhost" },
+                    { name: "DB_HOST", value: "localhost" },   // Java App connects to localhost, pgBouncer shares the same task
                     { name: "DB_PORT", value: "5432" }
                 ],
                 logConfiguration: {
@@ -185,17 +191,19 @@ const taskDefinition = new aws.ecs.TaskDefinition(`java-task-${environment}`, {
                 }
             },
             {
+                // Container #2  pgBouncer - Sidecar
+                // Java App connects here and pgBouncer pools data from the real DB.
                 name: "pgbouncer",
                 image: "pgbouncer/pgbouncer:latest",
                 essential: false,
                 portMappings: [{
-                    containerPort: 5432,
+                    containerPort: 5432,  
                     protocol: "tcp"
                 }],
                 environment: [
-                    { name: "DATABASES_HOST", value: "your-rds-endpoint" },
+                    { name: "DATABASES_HOST", value: "real-rds-endpoint" },
                     { name: "DATABASES_PORT", value: "5432" },
-                    { name: "DATABASES_DBNAME", value: "appdb" },
+                    { name: "DATABASES_DBNAME", value: "RAZRDB" },
                     { name: "PGBOUNCER_POOL_MODE", value: "transaction" },
                     { name: "PGBOUNCER_MAX_CLIENT_CONN", value: "100" }
                 ],
@@ -213,20 +221,20 @@ const taskDefinition = new aws.ecs.TaskDefinition(`java-task-${environment}`, {
 });
 
 
-// ── FARGATE SERVICE
+//              ------   FARGATE SERVICE   -------
 // Runs the task with configurable count per environment
 // enableExecuteCommand enables SSH into containers!
 
 const service = new aws.ecs.Service(`java-service-${environment}`, {
     cluster: cluster.arn,
     taskDefinition: taskDefinition.arn,
-    desiredCount: taskCount,
+    desiredCount: taskCount,       // Requirement #1
     launchType: "FARGATE",
-    enableExecuteCommand: true,
+    enableExecuteCommand: true,    // Requirement #3  SSH Mechanism, Enables ECS exec using AWS System Manager
     networkConfiguration: {
-        assignPublicIp: true,
+        assignPublicIp: true,      // For contianers to pull Docker images
         subnets: subnetIds,
-        securityGroups: [sg.id]
+        securityGroups: [sg.id]    // Applies security group firewall rules.
     },
     tags: { 
         Environment: environment, 
@@ -234,7 +242,7 @@ const service = new aws.ecs.Service(`java-service-${environment}`, {
     }
 });
 
-// ── EXPORTS 
+// EXPORTS 
 // Values shown after pulumi up completes
 
 export const clusterName = cluster.name;
