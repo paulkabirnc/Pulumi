@@ -1,5 +1,4 @@
 config:
   aws:region: us-west-2
   Razr-fargate-assignment:environment: dev
-  Razr-fargate-assignment:taskcCount: "1"
   Razr-fargate-assignment:taskCount: "1"
